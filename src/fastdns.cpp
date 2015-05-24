@@ -710,39 +710,42 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 	request.progress = progress;
 	// first, try to get all answers
 	if (get_answer(request.nq, request.anrr, request.use_cache) == true || no_more_data || no_domain || request.progress > QUESTION_MAX_REQUEST) { // we can response now
-		// copy result to stack
-		request_entry tmp_req = request;
-		// remove first, since llist may contain itself
-		// eg. cache: ns.domain.com  NS  ns.domain.com, and question: ns.domain.com  A
-		assert(request_expiry_map.count(tmp_req.rexpiry) != 0);
-		assert(request_expiry_map[tmp_req.rexpiry].count(&request) != 0);
-		request_expiry_map[tmp_req.rexpiry].erase(&request);
-		if (request_expiry_map[tmp_req.rexpiry].size() == 0) request_expiry_map.erase(tmp_req.rexpiry);
-		update_request_lastsend(request, false, true);
-		request_map.erase(tmp_req.question);
+		// copy llist to stack
+		std::map<question_entry, local_source> tmp_llist;
+		// clear request.llist to avoid recursion
+		tmp_llist.swap(request.llist);
+		// this resquest should be an orphan by now, since when callback happens, llist is cleared
+		// callback first
+		// some request may add itself back in llist while callback
+		// eg. question: ns1.domain.com  A, result: too many CNAME
+		// when callback, question(ns1.domain.com A) will be re-added
 		// find additional records
-		unsigned short adrrc = add_additional_answer(tmp_req.anrr);
+		unsigned short adrrc = add_additional_answer(request.anrr);
 		// then response
-		if (verbose) syslog(LOG_DEBUG, "Got answer for request(%d) %s, %d, %d: %s %s", tmp_req.progress, tmp_req.question.qname.c_str(), tmp_req.question.qclass, tmp_req.question.qtype, no_more_data ? "NODATA" : "", no_domain ? "NXDOMAIN" : "");
-		build_packet(false, no_domain, tmp_req.question, &tmp_req.anrr, adrrc);
-		for (std::list<remote_source>::iterator it = tmp_req.rlist.begin(); it != tmp_req.rlist.end(); ++it) {
+		if (verbose) syslog(LOG_DEBUG, "Got answer for request(%d) %s, %d, %d: %s %s", request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype, no_more_data ? "NODATA" : "", no_domain ? "NXDOMAIN" : "");
+		build_packet(false, no_domain, request.question, &request.anrr, adrrc);
+		for (std::list<remote_source>::iterator it = request.rlist.begin(); it != request.rlist.end(); ++it) {
 			ss.tx_response++;
 			if (verbose) syslog(LOG_DEBUG, "Send answer to remote %d", it->id);
 			send_packet(it->addr,it->id, true);
 		}
-		for (std::map<question_entry, local_source>::iterator it = tmp_req.llist.begin(); it != tmp_req.llist.end(); ++it) {
+		for (std::map<question_entry, local_source>::iterator it = tmp_llist.begin(); it != tmp_llist.end(); ++it) {
 			local_source& ls = it->second;
-			assert(ls.oq != tmp_req.question);
+			assert(ls.oq != request.question); // llist won't contain itself, since we already checked that when adding request
 			if (request_map.count(ls.oq) == 0) continue;
 			request_entry& local_request = request_map[ls.oq];
 			if ((no_more_data || no_domain) && ls.need_answer == false) continue;
 			if (local_request.progress != ls.progress) continue;
-			if (verbose) syslog(LOG_DEBUG, "Send answer to local request(%d) %s, %d, %d with new progress %d", local_request.progress, local_request.question.qname.c_str(), local_request.question.qclass, local_request.question.qtype, local_request.progress + tmp_req.progress - ls.base_progress);
-			// only recursion when we got the real answer
-			try_complete_request(local_request, no_more_data, no_domain, local_request.progress + tmp_req.progress - ls.base_progress);
+			if (verbose) syslog(LOG_DEBUG, "Send answer to local request(%d) %s, %d, %d with new progress %d", local_request.progress, local_request.question.qname.c_str(), local_request.question.qclass, local_request.question.qtype, local_request.progress + request.progress - ls.base_progress);
+			try_complete_request(local_request, no_more_data, no_domain, local_request.progress + request.progress - ls.base_progress);
 		}
+		assert(request_expiry_map.count(request.rexpiry) != 0);
+		assert(request_expiry_map[request.rexpiry].count(&request) != 0);
+		request_expiry_map[request.rexpiry].erase(&request);
+		if (request_expiry_map[request.rexpiry].size() == 0) request_expiry_map.erase(request.rexpiry);
+		update_request_lastsend(request, false, true);
+		request_map.erase(request_map.find(request.question));
 		if (verbose) syslog(LOG_DEBUG, "Complete request done");
-		assert(request_map.count(tmp_req.question) == 0);
 		return true;
 	}
 	// we need solve the new question
@@ -751,9 +754,10 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 	if (request.nq != request.question) {
 		request.ns.addrs.clear();
 		update_request_lastsend(request, false, true);
+		request.use_cache = true; // since we have the answer for the original question, from now on we use cache
 		if (verbose) syslog(LOG_DEBUG, "Add new request %s, %d, %d for request(%d) %s, %d, %d", request.nq.qname.c_str(), request.nq.qclass, request.nq.qtype, request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
 		request_entry* pentry;
-		// may already have answer in cache
+		// may already have answer in cache if use_cache was false
 		if (add_request(request.nq, &request.question, request.progress, NULL, 0, true, true, pentry)) return try_complete_request(*pentry, false, false, pentry->progress);
 		return false;
 	}
