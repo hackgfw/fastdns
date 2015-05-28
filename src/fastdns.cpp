@@ -710,11 +710,13 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 	request.progress = progress;
 	// first, try to get all answers
 	if (get_answer(request.nq, request.anrr, request.use_cache) == true || no_more_data || no_domain || request.progress > QUESTION_MAX_REQUEST) { // we can response now
+		// increase progress so that no one will try to complete this request
+		// this resquest should be an orphan by now
+		request.progress++;
 		// copy llist to stack
 		std::map<question_entry, local_source> tmp_llist;
 		// clear request.llist to avoid recursion
 		tmp_llist.swap(request.llist);
-		// this resquest should be an orphan by now, since when callback happens, llist is cleared
 		// callback first
 		// some request may add itself back in llist while callback
 		// eg. question: ns1.domain.com  A, result: too many CNAME
