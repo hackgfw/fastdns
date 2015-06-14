@@ -89,6 +89,8 @@ struct cache_entry {
 
 struct remote_source {
 	sockaddr_in addr;
+	in_addr local_addr;
+	unsigned int ifindex;
 	unsigned short id;	// id of original request
 };
 
@@ -153,11 +155,11 @@ void init_root();
 void handle_signal(int signal);
 bool add_response_cache_entry(ns_msg& handle, ns_rr& rr, const std::string& scope, std::map<question_entry, cache_entry>& entries, unsigned short& rrtype);
 void handle_response(ns_msg& handle, const sockaddr_in& addr);
-bool add_request(const question_entry& question, const question_entry* oq, unsigned int progress, const sockaddr_in *addr, unsigned short id,  bool need_answer, bool use_cache, request_entry*& pentry);
-void handle_request(ns_msg& handle, const sockaddr_in& addr);
-void handle_packet(const unsigned char* buf, int size, sockaddr_in& addr, bool local);
+bool add_request(const question_entry& question, const question_entry* oq, unsigned int progress, const sockaddr_in* addr, const in_addr* local_addr, unsigned int ifindex, unsigned short id,  bool need_answer, bool use_cache, request_entry*& pentry);
+void handle_request(ns_msg& handle, const sockaddr_in& addr, const in_addr& local_addr, unsigned int ifindex);
+void handle_packet(msghdr *msg, int size, bool local);
 void build_packet(bool query, bool no_domain, const question_entry& question, const std::vector<resource_entry>* anrr, unsigned short adrrc);
-void send_packet(const sockaddr_in& addr, unsigned short id, bool local);
+void send_packet(const sockaddr_in& addr, unsigned short id, const in_addr* local_addr, unsigned int ifindex, bool local);
 bool get_answer(question_entry& question, std::vector<resource_entry>& rr, bool use_cache);
 unsigned short add_additional_answer(std::vector<resource_entry>& rr);
 void find_nameserver(const question_entry& question, ns_list& ns, std::set<std::string>& ns_with_no_addr);
@@ -271,15 +273,29 @@ int main(int argc, char **argv) {
 			return -1;
 		}
 		if (FD_ISSET(lfd, &readfds) || FD_ISSET(rfd, &readfds)) {
-			socklen_t addr_len = sizeof(addr);
-			int rc=recvfrom(FD_ISSET(lfd, &readfds) ? lfd : rfd, recvbuf, sizeof(recvbuf), 0, (struct sockaddr*)&addr, &addr_len);
-			if (rc == 0) break;
-			else if (rc > 0) {
+			iovec iov[1];
+			msghdr msg;
+			char control[CMSG_SPACE(sizeof(in_pktinfo))];
+			iov[0].iov_base = recvbuf;
+			iov[0].iov_len = sizeof(recvbuf);
+			msg.msg_control = control;
+			msg.msg_controllen = sizeof(control);
+			msg.msg_flags = 0;
+			msg.msg_name = &addr;
+			msg.msg_namelen = sizeof(addr);
+			msg.msg_iov = iov;
+			msg.msg_iovlen = 1;
+
+			int rc = recvmsg(FD_ISSET(lfd, &readfds) ? lfd : rfd, &msg, 0);
+			if (rc >= 0) {
 				remote_addr = inet_ntoa(addr.sin_addr);
-				handle_packet(recvbuf, rc, addr, FD_ISSET(lfd, &readfds));
+				if (addr.sin_port == 0) syslog(LOG_ERR, "Drop packet received from %s:%d", remote_addr, addr.sin_port);
+				else if (msg.msg_flags & MSG_TRUNC) syslog(LOG_ERR, "Drop truncated packet received from %s", remote_addr);
+				else if (rc == 0) syslog(LOG_ERR, "Drop empty packet received from %s:%d", remote_addr, addr.sin_port);
+				else handle_packet(&msg, rc, FD_ISSET(lfd, &readfds));
 			}
 			else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-				syslog(LOG_ERR, "recvfrom encountered an error %d!", errno);
+				syslog(LOG_ERR, "recvmsg encountered an error %d!", errno);
 				return -1;
 			}
 		}
@@ -332,6 +348,11 @@ bool create_socket(int& fd, sockaddr_in* addr) {
 	}
 	if (addr && bind(fd, (struct sockaddr *)addr, sizeof(*addr)) < 0) {
 		syslog(LOG_ERR, "bind on port %d failed!", ntohs(addr->sin_port));
+		return false;
+	}
+	int opt = 1;
+	if (addr && setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &opt, sizeof(opt)) < 0) {
+		syslog(LOG_ERR, "setsockopt(IP_PKTINFO) failed!");
 		return false;
 	}
 	return true;
@@ -448,7 +469,7 @@ void handle_response(ns_msg& handle, const sockaddr_in& addr) {
 	cnq.qtype = T_CNAME;
 	// check result
 	if (rcode != NXDOMAIN && rcode != NOERROR) {
-		syslog(LOG_WARNING, "Drop packet with unsupported rcode %d received from %s", rcode, remote_addr);
+		if (verbose) syslog(LOG_WARNING, "Drop packet with unsupported rcode %d received from %s", rcode, remote_addr);
 		return;
 	}
 	// then check sender
@@ -488,7 +509,7 @@ void handle_response(ns_msg& handle, const sockaddr_in& addr) {
 		}
 		add_response_cache_entry(handle, rr, request.ns.scope, entries, rrtype);
 	}
-	bool no_more_data = no_soa == false || (no_ns == true && no_answer == true);
+	bool no_more_data = no_soa == false || (no_ns && no_answer);
 	bool no_domain = rcode == NXDOMAIN;
 	
 	for (std::map<question_entry, cache_entry>::iterator it = entries.begin(); it != entries.end(); ++it) {
@@ -527,7 +548,7 @@ void handle_response(ns_msg& handle, const sockaddr_in& addr) {
 	ss.rx_response_accepted++;
 }
 
-bool add_request(const question_entry& question, const question_entry* oq, unsigned int progress, const sockaddr_in *addr, unsigned short id,  bool need_answer, bool use_cache, request_entry*& pentry) {
+bool add_request(const question_entry& question, const question_entry* oq, unsigned int progress, const sockaddr_in* addr, const in_addr* local_addr, unsigned int ifindex, unsigned short id,  bool need_answer, bool use_cache, request_entry*& pentry) {
 	pentry = NULL;
 	bool missing = false;
 	// add request to request_map
@@ -560,13 +581,15 @@ bool add_request(const question_entry& question, const question_entry* oq, unsig
 	else if (addr) {
 		remote_source rs;
 		rs.addr = *addr;
+		rs.local_addr = *local_addr;
+		rs.ifindex = ifindex;
 		rs.id = id;
 		pentry->rlist.push_back(rs);
 	}
 	return missing;
 }
 
-void handle_request(ns_msg& handle, const sockaddr_in& addr) {
+void handle_request(ns_msg& handle, const sockaddr_in& addr, const in_addr& local_addr, unsigned int ifindex) {
 	ns_rr rr;
 	question_entry question;
 	ss.rx_query++;
@@ -580,12 +603,12 @@ void handle_request(ns_msg& handle, const sockaddr_in& addr) {
 	std::transform(question.qname.begin(), question.qname.end(), question.qname.begin(), ::tolower);
 	if (verbose) syslog(LOG_DEBUG, "Received request %d for question %s, %d, %d from %s", ns_msg_id(handle), question.qname.c_str(), question.qclass, question.qtype, remote_addr);
 	request_entry* pentry;
-	if (add_request(question, NULL, 0, &addr, ns_msg_id(handle), true, true, pentry)) try_complete_request(*pentry, false, false, pentry->progress);
+	if (add_request(question, NULL, 0, &addr, &local_addr, ifindex, ns_msg_id(handle), true, true, pentry)) try_complete_request(*pentry, false, false, pentry->progress);
 }
 
-void handle_packet(const unsigned char* buf, int size, sockaddr_in& addr, bool local) {
+void handle_packet(msghdr *msg, int size, bool local) {
 	ns_msg handle;
-	if (ns_initparse(buf,size,&handle) < 0) {
+	if (ns_initparse(recvbuf, size, &handle) < 0) {
 		syslog(LOG_WARNING, "Failed to parse packet received from %s", remote_addr);
 		return;
 	}
@@ -601,8 +624,21 @@ void handle_packet(const unsigned char* buf, int size, sockaddr_in& addr, bool l
 		syslog(LOG_WARNING, "Drop unauthorized packet received from %s", remote_addr);
 		return;
 	}
-	if (local) handle_request(handle, addr);
-	else handle_response(handle, addr);
+	if (local) {
+		in_addr local_addr;
+		unsigned int ifindex = 0;
+		cmsghdr *cmptr;
+		for (cmptr = CMSG_FIRSTHDR(msg); cmptr; cmptr = CMSG_NXTHDR(msg, cmptr)) {
+			if (cmptr->cmsg_level != IPPROTO_IP || cmptr->cmsg_type != IP_PKTINFO) continue;
+			const in_pktinfo* pi = (const in_pktinfo*)CMSG_DATA(cmptr);
+			local_addr = pi->ipi_addr;
+			ifindex = pi->ipi_ifindex;
+			break;
+		}
+		if (cmptr) handle_request(handle, *(sockaddr_in*)(msg->msg_name), local_addr, ifindex);
+		else syslog(LOG_WARNING, "Unable to get in_pktinfo in packet received from %s", remote_addr);
+	}
+	else handle_response(handle, *(sockaddr_in*)(msg->msg_name));
 }
 
 bool get_answer(question_entry& question, std::vector<resource_entry>& rr, bool use_cache) {
@@ -710,7 +746,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 	if (request.progress > progress) return false;
 	request.progress = progress;
 	// first, try to get all answers
-	if (get_answer(request.nq, request.anrr, request.use_cache) == true || no_more_data || no_domain || request.progress > QUESTION_MAX_REQUEST) { // we can response now
+	if (get_answer(request.nq, request.anrr, request.use_cache) || no_more_data || no_domain || request.progress > QUESTION_MAX_REQUEST) { // we can response now
 		// increase progress so that no one will try to complete this request
 		// this resquest should be an orphan by now
 		request.progress++;
@@ -730,7 +766,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 		for (std::list<remote_source>::iterator it = request.rlist.begin(); it != request.rlist.end(); ++it) {
 			ss.tx_response++;
 			if (verbose) syslog(LOG_DEBUG, "Send answer to remote %d", it->id);
-			send_packet(it->addr,it->id, true);
+			send_packet(it->addr, it->id, &(it->local_addr), it->ifindex, true);
 		}
 		for (std::map<question_entry, local_source>::iterator it = tmp_llist.begin(); it != tmp_llist.end(); ++it) {
 			local_source& ls = it->second;
@@ -761,7 +797,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 		if (verbose) syslog(LOG_DEBUG, "Add new request %s, %d, %d for request(%d) %s, %d, %d", request.nq.qname.c_str(), request.nq.qclass, request.nq.qtype, request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
 		request_entry* pentry;
 		// may already have answer in cache if use_cache was false
-		if (add_request(request.nq, &request.question, request.progress, NULL, 0, true, true, pentry)) return try_complete_request(*pentry, false, false, pentry->progress);
+		if (add_request(request.nq, &request.question, request.progress, NULL, NULL, 0, 0, true, true, pentry)) return try_complete_request(*pentry, false, false, pentry->progress);
 		return false;
 	}
 	std::set<std::string> ns_with_no_addr;
@@ -780,7 +816,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 			request.ns.addrs[it->first] = rand();
 			ss.tx_query++;
 			if (verbose) syslog(LOG_DEBUG, "Send query packet for request(%d) %s, %d, %d", request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
-			send_packet(it->first, request.ns.addrs[it->first], false);
+			send_packet(it->first, request.ns.addrs[it->first], NULL, 0, false);
 		}
 		if (update_lastsend) update_request_lastsend(request, false, false);
 	}
@@ -801,7 +837,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 			assert(cache_map.count(nsq) == 0);
 			if (verbose) syslog(LOG_DEBUG, "Add new request %s, %d, %d to find A record of nameserver for request(%d) %s, %d, %d", nsq.qname.c_str(), nsq.qclass, nsq.qtype, request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
 			request_entry* pentry;
-			if (add_request(nsq, &request.question, request.progress, NULL, 0, false, true, pentry)) reqs[nsq] = pentry->progress;
+			if (add_request(nsq, &request.question, request.progress, NULL, NULL, 0, 0, false, true, pentry)) reqs[nsq] = pentry->progress;
 		}
 		for (std::map<question_entry, unsigned int>::iterator it = reqs.begin(); it != reqs.end(); ++it) {
 			if (request_map.count(it->first) == 0) continue;
@@ -812,11 +848,39 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 	return false;
 }
 
-void send_packet(const sockaddr_in& addr, unsigned short id, bool local) {
+void send_packet(const sockaddr_in& addr, unsigned short id, const in_addr* local_addr, unsigned int ifindex, bool local) {
 	int fd = local ? lfd : rfd;
 	fd_set writefds, errorfds;
 	HEADER *ph = (HEADER *)sendbuf;
 	ph->id = htons(id);
+	iovec iov[1];
+	msghdr msg;
+	cmsghdr *cmsg;
+	char control[CMSG_SPACE(sizeof(in_pktinfo))];
+	iov[0].iov_base = sendbuf;
+	iov[0].iov_len = pspos - sendbuf;
+	msg.msg_flags = 0;
+	msg.msg_name = (void *)&addr;
+	msg.msg_namelen = sizeof(addr);
+	msg.msg_iov = iov;
+	msg.msg_iovlen = 1;
+	if (local_addr) {
+		msg.msg_control = control;
+		msg.msg_controllen = sizeof(control);
+		memset(&control, 0, sizeof(control));
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_level = IPPROTO_IP;
+		cmsg->cmsg_type = IP_PKTINFO;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(in_pktinfo));
+		in_pktinfo *pi = (in_pktinfo*)CMSG_DATA(cmsg);
+		pi->ipi_ifindex = ifindex;
+		pi->ipi_spec_dst = *local_addr;
+	}
+	else {
+		msg.msg_control = NULL;
+		msg.msg_controllen = 0;
+	}
+
 	while (true) {
 		FD_ZERO(&writefds);
 		FD_ZERO(&errorfds);
@@ -832,9 +896,9 @@ void send_packet(const sockaddr_in& addr, unsigned short id, bool local) {
 			return;
 		}
 		assert(FD_ISSET(fd, &writefds));
-		if (sendto(fd, sendbuf, pspos - sendbuf, 0, (const sockaddr*)&addr, sizeof(addr)) < 0) {
+		if (sendmsg(fd, &msg, 0) < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
-			syslog(LOG_WARNING, "sendto encountered an error %d", errno);
+			syslog(LOG_WARNING, "sendmsg encountered an error %d", errno);
 		}
 		break;
 	}
@@ -953,7 +1017,7 @@ void check_expiry() {
 		for (std::map<sockaddr_in, unsigned short>::iterator its = r->ns.addrs.begin(); its != r->ns.addrs.end(); ++its) {
 			ss.tx_query++;
 			if (verbose) syslog(LOG_DEBUG, "Resend query for request(%d) %s, %d, %d", r->progress, r->question.qname.c_str(), r->question.qclass, r->question.qtype);
-			send_packet(its->first, r->ns.addrs[its->first], false);
+			send_packet(its->first, r->ns.addrs[its->first], NULL, 0, false);
 		}
 		update_request_lastsend(*r, true, false);
 	}
@@ -981,7 +1045,7 @@ void check_expiry() {
 			if (verbose) syslog(LOG_DEBUG, "Refresh cache(%d) %s, %d, %d", (int)(centry->least_expiry - now.tv_sec), centry->question.qname.c_str(), centry->question.qclass, centry->question.qtype);
 			centry->last_update = now.tv_sec;
 			request_entry* rentry;
-			if (add_request(centry->question, NULL, 0, NULL, 0, false, false, rentry)) try_complete_request(*rentry, false, false, rentry->progress);
+			if (add_request(centry->question, NULL, 0, NULL, NULL, 0, 0, false, false, rentry)) try_complete_request(*rentry, false, false, rentry->progress);
 		}
 		if (it->first <= now.tv_sec) cache_expiry_map.erase(it++);
 		else ++it;
