@@ -307,8 +307,9 @@ timespec timespec_add(const timespec& a, int ms) {
 
 long long timespec_diff(const timespec& a, const timespec& b) {
 	long long result = 0;
-	if (a.tv_sec > b.tv_sec) result += (a.tv_sec - b.tv_sec) * 1000;
-	else result -= (b.tv_sec - a.tv_sec) * 1000;
+	if (a.tv_sec > b.tv_sec) result += a.tv_sec - b.tv_sec;
+	else result -= b.tv_sec - a.tv_sec;
+	result *= 1000;
 	result += a.tv_nsec/1000000;
 	result -= b.tv_nsec/1000000;
 	return result;
