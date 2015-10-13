@@ -18,8 +18,10 @@
 #include <algorithm>
 #include "config.h"
 
-#define RESPONSE_MAX_ANSWER_RR		32
-#define QUESTION_MAX_REQUEST		32
+#define RESPONSE_MAX_ANSWER_RR	32
+#define QUESTION_MAX_REQUEST	32
+
+#define RX_BUFF_SIZE		16384
 
 struct statistic_enrty {
 	unsigned int rx_query;
@@ -125,7 +127,7 @@ std::map<timespec, std::set<request_entry*> > query_expiry_map;
 unsigned char sendbuf[NS_PACKETSZ];
 unsigned char *pspos = sendbuf;
 unsigned char *psend = sendbuf+sizeof(sendbuf);
-unsigned char recvbuf[NS_PACKETSZ];
+unsigned char recvbuf[RX_BUFF_SIZE];
 statistic_enrty ss;
 ns_list root_addrs;
 char *remote_addr = NULL;
@@ -145,7 +147,7 @@ unsigned int cache_hard_watermark = 100000;
 unsigned int request_timeout = 5;
 unsigned int query_timeout = 500;
 unsigned int query_retry = 3;
-bool verbose = false;
+int verbose = 0;
 
 void print_help();
 timespec timespec_add(const timespec& a, int ms);
@@ -199,7 +201,7 @@ void print_help() {
 		"    -q timeout      query timeout in millisecond, fastdns will resend query to\n"
 		"                    nameserver if no response received, default: 500\n"
 		"    -y retry        query retry count when timeout, default: 3\n"
-		"    -v              verbose\n"
+		"    -v              be more verbose, can be specified multiple times\n"
 		"    -h              show this message\n"
 	);
 }
@@ -289,9 +291,9 @@ int main(int argc, char **argv) {
 			int rc = recvmsg(FD_ISSET(lfd, &readfds) ? lfd : rfd, &msg, 0);
 			if (rc >= 0) {
 				remote_addr = inet_ntoa(addr.sin_addr);
-				if (addr.sin_port == 0) syslog(LOG_ERR, "Drop packet received from %s:%d", remote_addr, addr.sin_port);
-				else if (msg.msg_flags & MSG_TRUNC) syslog(LOG_ERR, "Drop truncated packet received from %s", remote_addr);
-				else if (rc == 0) syslog(LOG_ERR, "Drop empty packet received from %s:%d", remote_addr, addr.sin_port);
+				if (addr.sin_port == 0) syslog(LOG_NOTICE, "Drop packet received from %s:%d", remote_addr, addr.sin_port);
+				else if (msg.msg_flags & MSG_TRUNC) syslog(LOG_NOTICE, "Drop truncated packet received from %s", remote_addr);
+				else if (rc == 0) syslog(LOG_NOTICE, "Drop empty packet received from %s:%d", remote_addr, addr.sin_port);
 				else handle_packet(&msg, rc, FD_ISSET(lfd, &readfds));
 			}
 			else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -395,19 +397,19 @@ bool add_response_cache_entry(ns_msg& handle, ns_rr& rr, const std::string& scop
 	std::transform(r.rq.qname.begin(), r.rq.qname.end(), r.rq.qname.begin(), ::tolower);
 	// check scope, avoid forgery attack
 	if (r.rq.qname.size() < scope.size() || r.rq.qname.compare(r.rq.qname.size() - scope.size(), scope.size(), scope) != 0) {
-		if (verbose) syslog(LOG_DEBUG, "Ignore record %s which conflicted with scope %s in response from %s", r.rq.qname.c_str(), scope.c_str(), remote_addr);
+		if (verbose >= 2) syslog(LOG_NOTICE, "Ignore record %s which conflicted with scope %s in response from %s", r.rq.qname.c_str(), scope.c_str(), remote_addr);
 		return false;
 	}
 	const unsigned char* pdata = ns_rr_rdata(rr);
 	unsigned int sdata = ns_rr_rdlen(rr);
 	if (sdata == 0) {
-		syslog(LOG_WARNING, "Size of record(rtype %d) in response from %s is too small", r.rq.qtype, remote_addr);
+		if (verbose >= 1) syslog(LOG_INFO, "Size of record(rtype %d) in response from %s is too small", r.rq.qtype, remote_addr);
 		return false;
 	}
 	switch (r.rq.qtype) {
 	case T_MX:
 		if (sdata <= 2) {
-			syslog(LOG_WARNING, "Size of MX record in response from %s is too small", remote_addr);
+			if (verbose >= 1) syslog(LOG_INFO, "Size of MX record in response from %s is too small", remote_addr);
 			return false;
 		}
 		r.rperf = ns_get16(pdata);
@@ -417,7 +419,7 @@ bool add_response_cache_entry(ns_msg& handle, ns_rr& rr, const std::string& scop
 	case T_CNAME:
 	case T_PTR:
 		if (ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), pdata, domain_name, sizeof(domain_name)) != (int)sdata) {
-			syslog(LOG_WARNING, "Failed to uncompress domain name of record(rtype %d) in response from %s", r.rq.qtype, remote_addr);
+			if (verbose >= 1) syslog(LOG_INFO, "Failed to uncompress domain name of record(rtype %d) in response from %s", r.rq.qtype, remote_addr);
 			return false;
 		}
 		r.rdata = domain_name;
@@ -432,7 +434,7 @@ bool add_response_cache_entry(ns_msg& handle, ns_rr& rr, const std::string& scop
 		// ignore SOA record
 		return false;
 	default:
-		syslog(LOG_WARNING, "Ignore unsupported record(rtype %d) in response from %s", r.rq.qtype, remote_addr);
+		if (verbose >= 1) syslog(LOG_INFO, "Ignore unsupported record(rtype %d) in response from %s", r.rq.qtype, remote_addr);
 		return false;
 	}
 	bool exist = entries.count(r.rq);
@@ -456,7 +458,7 @@ void handle_response(ns_msg& handle, const sockaddr_in& addr) {
 	std::map<question_entry, cache_entry> entries;
 	ss.rx_response++;
 	if (ns_parserr(&handle, ns_s_qd, 0, &rr) < 0) {
-		syslog(LOG_WARNING, "Failed to parse the first question in packet received from %s", remote_addr);
+		if (verbose >= 1) syslog(LOG_INFO, "Failed to parse the first question in packet received from %s", remote_addr);
 		return;
 	}
 	rcode = ns_msg_getflag(handle, ns_f_rcode);
@@ -469,7 +471,7 @@ void handle_response(ns_msg& handle, const sockaddr_in& addr) {
 	cnq.qtype = T_CNAME;
 	// check result
 	if (rcode != NXDOMAIN && rcode != NOERROR) {
-		if (verbose) syslog(LOG_WARNING, "Drop packet with unsupported rcode %d received from %s", rcode, remote_addr);
+		if (verbose >= 2) syslog(LOG_INFO, "Drop packet with unsupported rcode %d received from %s", rcode, remote_addr);
 		return;
 	}
 	// then check sender
@@ -478,12 +480,12 @@ void handle_response(ns_msg& handle, const sockaddr_in& addr) {
 	if (request.ns.addrs.count(addr) == 0) return;
 	if (id != request.ns.addrs[addr]) return;
 	
-	if (verbose) syslog(LOG_DEBUG, "Received response %d for question %s, %d, %d from %s", request.progress, question.qname.c_str(), question.qclass, question.qtype, remote_addr);
+	if (verbose >= 3) syslog(LOG_DEBUG, "Received response %d for question %s, %d, %d from %s", request.progress, question.qname.c_str(), question.qclass, question.qtype, remote_addr);
 	// first add the answer to cache
 	bool no_answer = true;
 	for (int i=0;i < ns_msg_count(handle, ns_s_an); i++) {
 		if (ns_parserr(&handle, ns_s_an, i, &rr) < 0) {
-			syslog(LOG_WARNING, "Failed to parse the number %d answer in packet received from %s", i, remote_addr);
+			if (verbose >= 1) syslog(LOG_INFO, "Failed to parse the number %d answer in packet received from %s", i, remote_addr);
 			return;
 		}
 		add_response_cache_entry(handle, rr, request.ns.scope, entries, rrtype);
@@ -494,7 +496,7 @@ void handle_response(ns_msg& handle, const sockaddr_in& addr) {
 	// then add authoritative nameservers
 	for (int i=0;i < ns_msg_count(handle, ns_s_ns); i++) {
 		if (ns_parserr(&handle, ns_s_ns, i, &rr) < 0) {
-			syslog(LOG_WARNING, "Failed to parse number %d authoritative record in packet received from %s", i, remote_addr);
+			if (verbose >= 1) syslog(LOG_INFO, "Failed to parse number %d authoritative record in packet received from %s", i, remote_addr);
 			return;
 		}
 		add_response_cache_entry(handle, rr, request.ns.scope, entries, rrtype);
@@ -504,7 +506,7 @@ void handle_response(ns_msg& handle, const sockaddr_in& addr) {
 	// last, additional records
 	for (int i=0;i < ns_msg_count(handle, ns_s_ar); i++) {
 		if (ns_parserr(&handle, ns_s_ar, i, &rr) < 0) {
-			syslog(LOG_WARNING, "Failed to parse number %d additional record in packet received from %s", i, remote_addr);
+			if (verbose >= 1) syslog(LOG_INFO, "Failed to parse number %d additional record in packet received from %s", i, remote_addr);
 			return;
 		}
 		add_response_cache_entry(handle, rr, request.ns.scope, entries, rrtype);
@@ -594,14 +596,14 @@ void handle_request(ns_msg& handle, const sockaddr_in& addr, const in_addr& loca
 	question_entry question;
 	ss.rx_query++;
 	if (ns_parserr(&handle, ns_s_qd, 0, &rr) < 0) {
-		syslog(LOG_WARNING, "Failed to parse the first question in packet received from %s", remote_addr);
+		if (verbose >= 1) syslog(LOG_INFO, "Failed to parse the first question in packet received from %s", remote_addr);
 		return;
 	}
 	question.qname = ns_rr_name(rr);
 	question.qtype = ns_rr_type(rr);
 	question.qclass = ns_rr_class(rr);
 	std::transform(question.qname.begin(), question.qname.end(), question.qname.begin(), ::tolower);
-	if (verbose) syslog(LOG_DEBUG, "Received request %d for question %s, %d, %d from %s", ns_msg_id(handle), question.qname.c_str(), question.qclass, question.qtype, remote_addr);
+	if (verbose >= 3) syslog(LOG_DEBUG, "Received request %d for question %s, %d, %d from %s", ns_msg_id(handle), question.qname.c_str(), question.qclass, question.qtype, remote_addr);
 	request_entry* pentry;
 	if (add_request(question, NULL, 0, &addr, &local_addr, ifindex, ns_msg_id(handle), true, true, pentry)) try_complete_request(*pentry, false, false, pentry->progress);
 }
@@ -609,19 +611,19 @@ void handle_request(ns_msg& handle, const sockaddr_in& addr, const in_addr& loca
 void handle_packet(msghdr *msg, int size, bool local) {
 	ns_msg handle;
 	if (ns_initparse(recvbuf, size, &handle) < 0) {
-		syslog(LOG_WARNING, "Failed to parse packet received from %s", remote_addr);
+		if (verbose >= 1) syslog(LOG_INFO, "Failed to parse packet received from %s", remote_addr);
 		return;
 	}
 	if (ns_msg_count(handle, ns_s_qd) < 1) {
-		syslog(LOG_WARNING, "No question in packet received from %s", remote_addr);
+		if (verbose >= 1) syslog(LOG_INFO, "No question in packet received from %s", remote_addr);
 		return;
 	}
 	if (ns_msg_getflag(handle, ns_f_opcode) != 0) {
-		syslog(LOG_WARNING, "Drop packet with unsupported opcode %d received from %s", ns_msg_getflag(handle, ns_f_opcode), remote_addr);
+		if (verbose >= 1) syslog(LOG_INFO, "Drop packet with unsupported opcode %d received from %s", ns_msg_getflag(handle, ns_f_opcode), remote_addr);
 		return;
 	}
 	if (!!ns_msg_getflag(handle, ns_f_qr) == local) {
-		syslog(LOG_WARNING, "Drop unauthorized packet received from %s", remote_addr);
+		if (verbose >= 1) syslog(LOG_NOTICE, "Drop unauthorized packet received from %s", remote_addr);
 		return;
 	}
 	if (local) {
@@ -761,11 +763,11 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 		// find additional records
 		unsigned short adrrc = add_additional_answer(request.anrr);
 		// then response
-		if (verbose) syslog(LOG_DEBUG, "Got answer for request(%d) %s, %d, %d: %s %s", request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype, no_more_data ? "NODATA" : "", no_domain ? "NXDOMAIN" : "");
-		build_packet(false, no_domain, request.question, &request.anrr, adrrc);
+		if (verbose >= 3) syslog(LOG_DEBUG, "Got answer for request(%d) %s, %d, %d: %s %s", request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype, no_more_data ? "NODATA" : "", no_domain ? "NXDOMAIN" : "");
 		for (std::list<remote_source>::iterator it = request.rlist.begin(); it != request.rlist.end(); ++it) {
 			ss.tx_response++;
-			if (verbose) syslog(LOG_DEBUG, "Send answer to remote %d", it->id);
+			if (verbose >= 3) syslog(LOG_DEBUG, "Send answer to remote %d", it->id);
+			if (it == request.rlist.begin()) build_packet(false, no_domain, request.question, &request.anrr, adrrc);
 			send_packet(it->addr, it->id, &(it->local_addr), it->ifindex, true);
 		}
 		for (std::map<question_entry, local_source>::iterator it = tmp_llist.begin(); it != tmp_llist.end(); ++it) {
@@ -775,7 +777,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 			request_entry& local_request = request_map[ls.oq];
 			if ((no_more_data || no_domain) && ls.need_answer == false) continue;
 			if (local_request.progress != ls.progress) continue;
-			if (verbose) syslog(LOG_DEBUG, "Send answer to local request(%d) %s, %d, %d with new progress %d", local_request.progress, local_request.question.qname.c_str(), local_request.question.qclass, local_request.question.qtype, local_request.progress + request.progress - ls.base_progress);
+			if (verbose >= 3) syslog(LOG_DEBUG, "Send answer to local request(%d) %s, %d, %d with new progress %d", local_request.progress, local_request.question.qname.c_str(), local_request.question.qclass, local_request.question.qtype, local_request.progress + request.progress - ls.base_progress);
 			try_complete_request(local_request, no_more_data, no_domain, local_request.progress + request.progress - ls.base_progress);
 		}
 		assert(request_expiry_map.count(request.rexpiry) != 0);
@@ -784,7 +786,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 		if (request_expiry_map[request.rexpiry].size() == 0) request_expiry_map.erase(request.rexpiry);
 		update_request_lastsend(request, false, true);
 		request_map.erase(request_map.find(request.question));
-		if (verbose) syslog(LOG_DEBUG, "Complete request done");
+		if (verbose >= 3) syslog(LOG_DEBUG, "Complete request done");
 		return true;
 	}
 	// we need solve the new question
@@ -794,7 +796,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 		request.ns.addrs.clear();
 		update_request_lastsend(request, false, true);
 		request.use_cache = true; // since we have the answer for the original question, from now on we use cache
-		if (verbose) syslog(LOG_DEBUG, "Add new request %s, %d, %d for request(%d) %s, %d, %d", request.nq.qname.c_str(), request.nq.qclass, request.nq.qtype, request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
+		if (verbose >= 3) syslog(LOG_DEBUG, "Add new request %s, %d, %d for request(%d) %s, %d, %d", request.nq.qname.c_str(), request.nq.qclass, request.nq.qtype, request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
 		request_entry* pentry;
 		// may already have answer in cache if use_cache was false
 		if (add_request(request.nq, &request.question, request.progress, NULL, NULL, 0, 0, true, true, pentry)) return try_complete_request(*pentry, false, false, pentry->progress);
@@ -815,7 +817,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 			update_lastsend = true;
 			request.ns.addrs[it->first] = rand();
 			ss.tx_query++;
-			if (verbose) syslog(LOG_DEBUG, "Send query packet for request(%d) %s, %d, %d", request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
+			if (verbose >= 3) syslog(LOG_DEBUG, "Send query packet for request(%d) %s, %d, %d", request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
 			send_packet(it->first, request.ns.addrs[it->first], NULL, 0, false);
 		}
 		if (update_lastsend) update_request_lastsend(request, false, false);
@@ -835,7 +837,7 @@ bool try_complete_request(request_entry& request, bool no_more_data, bool no_dom
 			nsq.qname = *it;
 			if (nsq == request.question) continue;
 			assert(cache_map.count(nsq) == 0);
-			if (verbose) syslog(LOG_DEBUG, "Add new request %s, %d, %d to find A record of nameserver for request(%d) %s, %d, %d", nsq.qname.c_str(), nsq.qclass, nsq.qtype, request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
+			if (verbose >= 3) syslog(LOG_DEBUG, "Add new request %s, %d, %d to find A record of nameserver for request(%d) %s, %d, %d", nsq.qname.c_str(), nsq.qclass, nsq.qtype, request.progress, request.question.qname.c_str(), request.question.qclass, request.question.qtype);
 			request_entry* pentry;
 			if (add_request(nsq, &request.question, request.progress, NULL, NULL, 0, 0, false, true, pentry)) reqs[nsq] = pentry->progress;
 		}
@@ -920,11 +922,11 @@ void build_packet(bool query, bool no_domain, const question_entry& question, co
 	ph->ra = query ? false : true;
 	ph->rcode = no_domain? NXDOMAIN : NOERROR;
 	if (psend - pspos < QFIXEDSZ) {
-		syslog(LOG_WARNING, "Not enough fixed buff to build question: %s, %d, %d", question.qname.c_str(), question.qclass, question.qtype);
+		if (verbose >= 2) syslog(LOG_INFO, "Not enough fixed buff to build question: %s, %d, %d", question.qname.c_str(), question.qclass, question.qtype);
 		return;
 	}
 	if ((n = ns_name_compress(question.qname.c_str(), pspos, psend - pspos - QFIXEDSZ, dnptrs, lastdnptr)) < 0) {
-		syslog(LOG_WARNING, "Not enough buff to build question: %s, %d, %d", question.qname.c_str(), question.qclass, question.qtype);
+		if (verbose >= 2) syslog(LOG_INFO, "Not enough buff to build question: %s, %d, %d", question.qname.c_str(), question.qclass, question.qtype);
 		return;
 	}
 	pspos += n;
@@ -934,11 +936,11 @@ void build_packet(bool query, bool no_domain, const question_entry& question, co
 	for (int i = 0; anrr && i < (int)anrr->size() && i < RESPONSE_MAX_ANSWER_RR;) {
 		const resource_entry& r = (*anrr)[i];
 		if (psend - pspos < RRFIXEDSZ) {
-			syslog(LOG_WARNING, "Not enough fixed buff to build answer %d for question: %s, %d, %d", i, question.qname.c_str(), question.qclass, question.qtype);
+			if (verbose >= 2) syslog(LOG_INFO, "Not enough fixed buff to build answer %d for question: %s, %d, %d", i, question.qname.c_str(), question.qclass, question.qtype);
 			return;
 		}
 		if ((n = ns_name_compress(r.rq.qname.c_str(), pspos, psend - pspos - RRFIXEDSZ, dnptrs, lastdnptr)) < 0) {
-			syslog(LOG_WARNING, "Not enough buff to build answer %d for question: %s, %d, %d", i, question.qname.c_str(), question.qclass, question.qtype);
+			if (verbose >= 2) syslog(LOG_INFO, "Not enough buff to build answer %d for question: %s, %d, %d", i, question.qname.c_str(), question.qclass, question.qtype);
 			return;
 		}
 		pspos += n;
@@ -950,7 +952,7 @@ void build_packet(bool query, bool no_domain, const question_entry& question, co
 		switch (r.rq.qtype) {
 		case T_MX:
 			if (psend - pspos < INT16SZ) {
-				syslog(LOG_WARNING, "Not enough fixed buff to build MX answer %d for question: %s, %d, %d", i, question.qname.c_str(), question.qclass, question.qtype);
+				if (verbose >= 2) syslog(LOG_INFO, "Not enough fixed buff to build MX answer %d for question: %s, %d, %d", i, question.qname.c_str(), question.qclass, question.qtype);
 				return;
 			}
 			ns_put16(r.rperf, pspos);	pspos += INT16SZ;		rsize += INT16SZ;
@@ -958,7 +960,7 @@ void build_packet(bool query, bool no_domain, const question_entry& question, co
 		case T_CNAME:
 		case T_PTR:
 			if ((n = ns_name_compress(r.rdata.c_str(), pspos, psend - pspos, dnptrs, lastdnptr)) < 0) {
-				syslog(LOG_WARNING, "Failed to compress domain name %s in answer %d(rtype %d) for question: %s, %d, %d", r.rdata.c_str(), i, r.rq.qtype, question.qname.c_str(), question.qclass, question.qtype);
+				if (verbose >= 2) syslog(LOG_INFO, "Failed to compress domain name %s in answer %d(rtype %d) for question: %s, %d, %d", r.rdata.c_str(), i, r.rq.qtype, question.qname.c_str(), question.qclass, question.qtype);
 				return;
 			}
 			pspos += n;
@@ -968,7 +970,7 @@ void build_packet(bool query, bool no_domain, const question_entry& question, co
 		case T_A:
 		case T_AAAA:
 			if (psend - pspos < (int)r.rdata.size()) {
-				syslog(LOG_WARNING, "Not enough buff to build answer %d(rtype %d, rsize %d) for question: %s, %d, %d", i, r.rq.qtype, (int)r.rdata.size(), question.qname.c_str(), question.qclass, question.qtype);
+				if (verbose >= 2) syslog(LOG_INFO, "Not enough buff to build answer %d(rtype %d, rsize %d) for question: %s, %d, %d", i, r.rq.qtype, (int)r.rdata.size(), question.qname.c_str(), question.qclass, question.qtype);
 				return;
 			}
 			memcpy(pspos, r.rdata.c_str(), r.rdata.size());
@@ -976,7 +978,7 @@ void build_packet(bool query, bool no_domain, const question_entry& question, co
 			rsize += r.rdata.size();
 			break;
 		default:
-			syslog(LOG_WARNING, "Failed to build answer %d(unsupported rtype %d) for question: %s, %d, %d", i, r.rq.qtype, question.qname.c_str(), question.qclass, question.qtype);
+			if (verbose >= 1) syslog(LOG_NOTICE, "Failed to build answer %d(unsupported rtype %d) for question: %s, %d, %d", i, r.rq.qtype, question.qname.c_str(), question.qclass, question.qtype);
 			return;
 		}
 		*prsize = htons(rsize);
@@ -997,7 +999,7 @@ void check_expiry() {
 			assert(request_map[q].rexpiry == request_expiry_map.begin()->first);
 			ss.request_timeout++;
 			update_request_lastsend(request_map[q], false, true);
-			if (verbose) syslog(LOG_DEBUG, "Remove timed out request(%d) %s, %d, %d", r->progress, q.qname.c_str(), q.qclass, q.qtype);
+			if (verbose >= 1) syslog(LOG_DEBUG, "Remove timed out request(%d) %s, %d, %d", r->progress, q.qname.c_str(), q.qclass, q.qtype);
 			request_map.erase(q);
 		}
 		request_expiry_map.erase(request_expiry_map.begin());
@@ -1016,7 +1018,7 @@ void check_expiry() {
 		build_packet(true, false, r->question, NULL, 0);
 		for (std::map<sockaddr_in, unsigned short>::iterator its = r->ns.addrs.begin(); its != r->ns.addrs.end(); ++its) {
 			ss.tx_query++;
-			if (verbose) syslog(LOG_DEBUG, "Resend query for request(%d) %s, %d, %d", r->progress, r->question.qname.c_str(), r->question.qclass, r->question.qtype);
+			if (verbose >= 2) syslog(LOG_DEBUG, "Resend query for request(%d) %s, %d, %d", r->progress, r->question.qname.c_str(), r->question.qclass, r->question.qtype);
 			send_packet(its->first, r->ns.addrs[its->first], NULL, 0, false);
 		}
 		update_request_lastsend(*r, true, false);
@@ -1032,7 +1034,7 @@ void check_expiry() {
 			if (centry->least_expiry <= now.tv_sec) {
 				question_entry q = centry->question;
 				ss.cache_timeout++;
-				if (verbose) syslog(LOG_DEBUG, "Remove expired cache %s, %d, %d", q.qname.c_str(), q.qclass, q.qtype);
+				if (verbose >= 3) syslog(LOG_DEBUG, "Remove expired cache %s, %d, %d", q.qname.c_str(), q.qclass, q.qtype);
 				cache_map.erase(q);
 				continue;
 			}
@@ -1042,7 +1044,7 @@ void check_expiry() {
 				else if (cache_map.size() > cache_soft_watermark && centry->last_use < now.tv_sec - cache_soft_lru) continue;
 			}
 			ss.cache_refresh++;
-			if (verbose) syslog(LOG_DEBUG, "Refresh cache(%d) %s, %d, %d", (int)(centry->least_expiry - now.tv_sec), centry->question.qname.c_str(), centry->question.qclass, centry->question.qtype);
+			if (verbose >= 3) syslog(LOG_DEBUG, "Refresh cache(%d) %s, %d, %d", (int)(centry->least_expiry - now.tv_sec), centry->question.qname.c_str(), centry->question.qclass, centry->question.qtype);
 			centry->last_update = now.tv_sec;
 			request_entry* rentry;
 			if (add_request(centry->question, NULL, 0, NULL, NULL, 0, 0, false, false, rentry)) try_complete_request(*rentry, false, false, rentry->progress);
@@ -1093,7 +1095,7 @@ bool parse_option(int argc, char **argv) {
 			query_retry = atoi(optarg);
 			break;
 		case 'v':
-			verbose = true;
+			verbose++;
 			break;
 		default:
 			print_help();
